@@ -1,0 +1,15 @@
+[package]
+name = "n1mm_bridge"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "N1MM+ bridge for FD Logger — implements the N1MM peer protocol on port 12070"
+
+[[bin]]
+name = "n1mm_bridge"
+path = "src/main.rs"
+
+[dependencies]
+tokio  = { version = "1", features = ["full"] }
+chrono = "0.4"
+clap   = { version = "4", features = ["derive"] }
