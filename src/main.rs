@@ -384,25 +384,10 @@ async fn run_udp_listener(cfg: Arc<Config>) {
                     continue;
                 }
                 println!("[12070] ← UDP announce from {}: {}", from, text.trim());
-                // Parse: station%ip%port%version%station%%
-                let parts: Vec<&str> = text.trim().split('%').collect();
-                if parts.len() >= 4 {
-                    let peer_ip   = parts[1];
-                    let peer_port = parts[2].parse::<u16>().unwrap_or(TCP_PORT);
-                    let peer_addr = format!("{}:{}", peer_ip, peer_port);
-                    println!("[12070] → initiating TCP connection to {}", peer_addr);
-                    let cfg2 = cfg.clone();
-                    tokio::spawn(async move {
-                        match TcpStream::connect(&peer_addr).await {
-                            Ok(stream) => {
-                                let peer = stream.peer_addr()
-                                    .unwrap_or_else(|_| peer_addr.parse().unwrap());
-                                handle_connection(stream, peer, cfg2).await;
-                            }
-                            Err(e) => eprintln!("[12070] TCP connect to {} failed: {}", peer_addr, e),
-                        }
-                    });
-                }
+                // N1MM connects to us (inbound) after seeing our UDP announces.
+                // We do not initiate outbound connections — doing so on every
+                // 20-second announce cycle would create duplicate connections that
+                // N1MM drops with "other end closed connection" errors.
             }
             Err(e) => eprintln!("[12070] UDP recv error: {}", e),
         }
