@@ -53,6 +53,10 @@ struct Args {
     /// UDP broadcast address for announces
     #[arg(long, default_value = "255.255.255.255")]
     broadcast: String,
+
+    /// Path to fd_logger.db (enables port 12060 XML contact listener)
+    #[arg(long, short = 'd', default_value = "fd_logger.db")]
+    db: String,
 }
 
 // ── Shared config ─────────────────────────────────────────────────────────────
@@ -64,6 +68,7 @@ struct Config {
     contest:   String,
     local_ip:  String,
     broadcast: String,
+    db_path:   String,
 }
 
 impl Config {
@@ -74,6 +79,7 @@ impl Config {
             contest:   a.contest.to_uppercase(),
             local_ip:  a.local_ip.clone(),
             broadcast: a.broadcast.clone(),
+            db_path:   a.db.clone(),
         }
     }
 }
@@ -403,6 +409,173 @@ async fn run_udp_listener(cfg: Arc<Config>) {
     }
 }
 
+// ── Port 12060 XML contact listener ──────────────────────────────────────────
+//
+// N1MM+ broadcasts each logged QSO as an XML UDP datagram on port 12060.
+// We parse it and insert it into fd_logger.db so the web UI stays in sync.
+
+#[derive(Debug)]
+struct XmlContact {
+    call:     String,
+    band:     String,
+    mode:     String,
+    class:    String,
+    section:  String,
+    operator: String,
+    date:     String,
+    time:     String,
+    n1mm_id:  String,
+}
+
+/// Map N1MM band-in-meters string to fd_logger's uppercase "NNM" format.
+fn band_from_n1mm(s: &str) -> Option<String> {
+    match s.trim() {
+        "160" => Some("160M".into()),
+        "80"  => Some("80M".into()),
+        "60"  => Some("60M".into()),
+        "40"  => Some("40M".into()),
+        "30"  => Some("30M".into()),
+        "20"  => Some("20M".into()),
+        "17"  => Some("17M".into()),
+        "15"  => Some("15M".into()),
+        "12"  => Some("12M".into()),
+        "10"  => Some("10M".into()),
+        "6"   => Some("6M".into()),
+        "2"   => Some("2M".into()),
+        "0.7" | "70cm" | "70CM" => Some("70CM".into()),
+        _     => None,
+    }
+}
+
+/// Map N1MM mode string to fd_logger's PH / CW / DIG.
+fn mode_from_n1mm(s: &str) -> String {
+    match s.trim().to_uppercase().as_str() {
+        "CW"                       => "CW".into(),
+        "USB" | "LSB" | "FM" | "AM" => "PH".into(),
+        _                           => "DIG".into(),
+    }
+}
+
+/// Parse an N1MM+ <contactinfo> XML datagram into an XmlContact.
+/// Returns None for non-contact messages (contactreplace, contactdelete, etc.)
+/// or packets missing required fields.
+fn parse_xml_contact(xml: &str) -> Option<XmlContact> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let root = doc.root_element();
+
+    if root.tag_name().name() != "contactinfo" {
+        return None;
+    }
+
+    let get = |tag: &str| -> String {
+        doc.descendants()
+            .find(|n| n.tag_name().name() == tag)
+            .and_then(|n| n.text())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+
+    let call    = get("call");
+    let n1mm_id = get("ID");
+    if call.is_empty() || n1mm_id.is_empty() {
+        return None;
+    }
+
+    let band = band_from_n1mm(&get("band"))?;
+    let mode = mode_from_n1mm(&get("mode"));
+
+    // timestamp field: "YYYY-MM-DD HH:MM:SS"
+    let ts = get("timestamp");
+    let (date, time) = match ts.split_once(' ') {
+        Some((d, t)) => (d.to_string(), t.get(..5).unwrap_or(t).to_string()),
+        None         => (ts.clone(), "00:00".to_string()),
+    };
+
+    Some(XmlContact {
+        call:     call.to_uppercase(),
+        band,
+        mode,
+        class:    get("exchange1").to_uppercase(),
+        section:  get("section").to_uppercase(),
+        operator: get("operator").to_uppercase(),
+        date,
+        time,
+        n1mm_id,
+    })
+}
+
+/// Insert a contact into fd_logger.db if the n1mm_id is not already present.
+/// Returns Ok(true) if inserted, Ok(false) if duplicate.
+fn db_insert_contact(db_path: &str, c: XmlContact) -> rusqlite::Result<bool> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM contacts WHERE n1mm_id = ?1",
+        rusqlite::params![c.n1mm_id],
+        |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+
+    if exists {
+        return Ok(false);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO contacts
+             (date, time, call, band, mode, class, section, operator, created_at, n1mm_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            c.date, c.time, c.call, c.band, c.mode,
+            c.class, c.section, c.operator, now, c.n1mm_id
+        ],
+    )?;
+    Ok(true)
+}
+
+async fn run_xml_listener(cfg: Arc<Config>) {
+    let db_path = cfg.db_path.clone();
+    let addr = "0.0.0.0:12060";
+    let sock = match UdpSocket::bind(addr).await {
+        Ok(s)  => { println!("[12060] UDP listening on {} (db: {})", addr, db_path); s }
+        Err(e) => { eprintln!("[12060] Cannot bind UDP {}: {}", addr, e); return; }
+    };
+
+    let mut buf = vec![0u8; 65535];
+    loop {
+        match sock.recv_from(&mut buf).await {
+            Ok((n, from)) => {
+                let xml = String::from_utf8_lossy(&buf[..n]).to_string();
+                println!("[12060] ← {} bytes from {}", n, from);
+                match parse_xml_contact(&xml) {
+                    Some(contact) => {
+                        println!("[12060]   {} {} {} {} {}",
+                            contact.call, contact.band, contact.mode,
+                            contact.class, contact.section);
+                        let db = db_path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            match db_insert_contact(&db, contact) {
+                                Ok(true)  => println!("[12060]   → inserted"),
+                                Ok(false) => println!("[12060]   → duplicate, skipped"),
+                                Err(e)    => eprintln!("[12060]   DB error: {}", e),
+                            }
+                        });
+                    }
+                    None => {
+                        // Log the root tag name so we can see what we ignored
+                        let tag = roxmltree::Document::parse(&xml).ok()
+                            .map(|d| d.root_element().tag_name().name().to_string())
+                            .unwrap_or_else(|| "<parse error>".into());
+                        println!("[12060]   ignored <{}>", tag);
+                    }
+                }
+            }
+            Err(e) => eprintln!("[12060] recv error: {}", e),
+        }
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -415,14 +588,17 @@ async fn main() {
     println!("  Callsign: {}", cfg.callsign);
     println!("  Contest : {}", cfg.contest);
     println!("  Local IP: {}", cfg.local_ip);
+    println!("  DB      : {}", cfg.db_path);
 
     let t1 = tokio::spawn(run_tcp_listener(cfg.clone()));
     let t2 = tokio::spawn(run_udp_broadcaster(cfg.clone()));
     let t3 = tokio::spawn(run_udp_listener(cfg.clone()));
+    let t4 = tokio::spawn(run_xml_listener(cfg.clone()));
 
     tokio::select! {
         _ = t1 => eprintln!("TCP listener exited"),
         _ = t2 => eprintln!("UDP broadcaster exited"),
         _ = t3 => eprintln!("UDP listener exited"),
+        _ = t4 => eprintln!("XML listener exited"),
     }
 }

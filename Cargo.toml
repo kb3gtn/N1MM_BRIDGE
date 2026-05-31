@@ -10,6 +10,8 @@ name = "n1mm_bridge"
 path = "src/main.rs"
 
 [dependencies]
-tokio  = { version = "1", features = ["full"] }
-chrono = "0.4"
-clap   = { version = "4", features = ["derive"] }
+tokio     = { version = "1", features = ["full"] }
+chrono    = "0.4"
+clap      = { version = "4", features = ["derive"] }
+roxmltree = "0.20"
+rusqlite  = { version = "0.31", features = ["bundled"] }
