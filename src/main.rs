@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -87,7 +87,7 @@ impl Config {
 // ── Message builders ──────────────────────────────────────────────────────────
 
 fn now_parts() -> (String, String) {
-    let now = Utc::now();
+    let now = Local::now();
     (now.format("%Y-%m-%d").to_string(), now.format("%H:%M:%S").to_string())
 }
 
@@ -99,7 +99,7 @@ fn udp_announce(cfg: &Config) -> String {
 
 fn msg_lastqat(cfg: &Config) -> String {
     // TODO: read actual last QSO time from fd_logger.db
-    let now = Utc::now();
+    let now = Local::now();
     let ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
     format!("DATA__00%{}%LASTQAT%{}%~__DATA", cfg.station, ts)
 }
