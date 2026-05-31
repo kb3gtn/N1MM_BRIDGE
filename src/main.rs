@@ -210,12 +210,12 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, cfg: Arc<Config>
 
     let (mut read_half, mut write_half) = stream.into_split();
 
-    // Send initial handshake burst
+    // Real N1MM sends only QSONRS + LASTQAT on connect; ECHOREQ/CONTESTNAME/STATUS
+    // are sent by the periodic timer (~10 s later).  Sending ECHOREQ immediately
+    // causes N1MM to ignore it (wrong protocol state) and never respond with ECHO.
     let handshake = [
+        msg_qsonrs(&cfg),
         msg_lastqat(&cfg),
-        msg_echoreq(&cfg),
-        msg_contestname(&cfg),
-        msg_status(&cfg),
     ];
     for msg in &handshake {
         println!("[12070] → {} TX: {}", peer, msg.trim());
