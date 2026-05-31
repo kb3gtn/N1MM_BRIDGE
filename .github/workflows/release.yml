@@ -50,10 +50,10 @@ jobs:
           name: n1mm_bridge-linux-x86_64
           path: n1mm_bridge-linux-x86_64.tar.gz
 
-  # ── Windows x86-64 ───────────────────────────────────────────────────────────
-  build-windows:
-    name: Build – Windows x86-64
-    runs-on: windows-latest
+  # ── macOS aarch64 (Apple Silicon) ────────────────────────────────────────────
+  build-macos-arm:
+    name: Build – macOS aarch64 (Apple Silicon)
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -67,29 +67,29 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-x86_64-${{ hashFiles('Cargo.lock') }}
+          key: macos-aarch64-${{ hashFiles('Cargo.lock') }}
 
       - name: Build
         run: cargo build --release
 
       - name: Package
-        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist\n1mm_bridge | Out-Null
-          Copy-Item target\release\n1mm_bridge.exe dist\n1mm_bridge\
-          Copy-Item README.md                      dist\n1mm_bridge\
-          Copy-Item LICENSE                        dist\n1mm_bridge\
-          Compress-Archive -Path dist\n1mm_bridge -DestinationPath n1mm_bridge-windows-x86_64.zip
+          mkdir -p dist/n1mm_bridge
+          cp target/release/n1mm_bridge dist/n1mm_bridge/
+          cp README.md                  dist/n1mm_bridge/
+          cp LICENSE                    dist/n1mm_bridge/
+          cd dist
+          tar -czf ../n1mm_bridge-macos-aarch64.tar.gz n1mm_bridge
 
       - uses: actions/upload-artifact@v4
         with:
-          name: n1mm_bridge-windows-x86_64
-          path: n1mm_bridge-windows-x86_64.zip
+          name: n1mm_bridge-macos-aarch64
+          path: n1mm_bridge-macos-aarch64.tar.gz
 
   # ── GitHub Release ────────────────────────────────────────────────────────────
   release:
     name: Create Release
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-macos-intel, build-macos-arm, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -109,4 +109,4 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/n1mm_bridge-linux-x86_64/n1mm_bridge-linux-x86_64.tar.gz
-            artifacts/n1mm_bridge-windows-x86_64/n1mm_bridge-windows-x86_64.zip
+            artifacts/n1mm_bridge-macos-aarch64/n1mm_bridge-macos-aarch64.tar.gz
