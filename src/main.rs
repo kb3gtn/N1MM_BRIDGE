@@ -10,8 +10,9 @@
 //! Message frame format:
 //!   DATA__00%<sender>%<command>%<fields...>%~__DATA
 
+use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,8 +21,12 @@ use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::net::tcp::OwnedReadHalf;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::time::interval;
+
+// Track IPs we currently have an outbound TCP connection to, so we connect
+// exactly once per peer (not on every UDP announce).
+type ConnectedPeers = Arc<TokioMutex<HashSet<IpAddr>>>;
 
 // ── Version we advertise to N1MM peers ───────────────────────────────────────
 
@@ -205,7 +210,13 @@ fn parse_frame(raw: &str) -> Option<InMsg> {
 
 // ── TCP connection handler ────────────────────────────────────────────────────
 
-async fn handle_connection(stream: TcpStream, peer: SocketAddr, cfg: Arc<Config>) {
+async fn handle_connection(
+    stream:  TcpStream,
+    peer:    SocketAddr,
+    cfg:     Arc<Config>,
+    // Some only for outbound connections — None for inbound (we don't track those)
+    outbound_peers: Option<ConnectedPeers>,
+) {
     println!("[12070] connected: {}", peer);
 
     let (mut read_half, mut write_half) = stream.into_split();
@@ -293,6 +304,11 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, cfg: Arc<Config>
             }
         }
     }
+
+    // If this was an outbound connection, unregister so we can reconnect later.
+    if let Some(peers) = outbound_peers {
+        peers.lock().await.remove(&peer.ip());
+    }
 }
 
 /// Process one incoming message and return a reply to send, if any.
@@ -330,7 +346,7 @@ async fn run_tcp_listener(cfg: Arc<Config>) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let cfg = cfg.clone();
-                tokio::spawn(handle_connection(stream, peer, cfg));
+                tokio::spawn(handle_connection(stream, peer, cfg, None));
             }
             Err(e) => eprintln!("[12070] accept error: {}", e),
         }
@@ -364,7 +380,7 @@ async fn run_udp_broadcaster(cfg: Arc<Config>) {
 
 // ── UDP listener (discover N1MM peers) ───────────────────────────────────────
 
-async fn run_udp_listener(cfg: Arc<Config>) {
+async fn run_udp_listener(cfg: Arc<Config>, peers: ConnectedPeers) {
     let addr = format!("0.0.0.0:{}", UDP_PORT);
     let sock = match UdpSocket::bind(&addr).await {
         Ok(s)  => { println!("[12070] UDP listening on {}", addr); s }
@@ -377,17 +393,49 @@ async fn run_udp_listener(cfg: Arc<Config>) {
     let mut buf = vec![0u8; 1024];
     loop {
         match sock.recv_from(&mut buf).await {
-            Ok((n, from)) => {
+            Ok((n, _from)) => {
                 let text = String::from_utf8_lossy(&buf[..n]);
-                // Ignore our own announces
                 if text.starts_with(cfg.station.as_str()) {
-                    continue;
+                    continue; // ignore our own announces
                 }
-                println!("[12070] ← UDP announce from {}: {}", from, text.trim());
-                // N1MM connects to us (inbound) after seeing our UDP announces.
-                // We do not initiate outbound connections — doing so on every
-                // 20-second announce cycle would create duplicate connections that
-                // N1MM drops with "other end closed connection" errors.
+                // Parse: station%ip%port%version%...
+                let parts: Vec<&str> = text.trim().split('%').collect();
+                if parts.len() < 3 { continue; }
+                let peer_ip: IpAddr = match parts[1].parse() {
+                    Ok(ip) => ip,
+                    Err(_) => continue,
+                };
+                let peer_port: u16 = parts[2].parse().unwrap_or(TCP_PORT);
+
+                // Connect outbound only if we don't already have an active
+                // connection to this peer.  Without an outbound connection,
+                // N1MM shows "Received FAIL" because it tracks inbound TCP
+                // connections from peers as the "received" health indicator.
+                {
+                    let mut locked = peers.lock().await;
+                    if locked.contains(&peer_ip) {
+                        continue; // already connected
+                    }
+                    locked.insert(peer_ip);
+                }
+
+                let peer_addr = format!("{}:{}", peer_ip, peer_port);
+                println!("[12070] → outbound TCP to {}", peer_addr);
+                let cfg2   = cfg.clone();
+                let peers2 = peers.clone();
+                tokio::spawn(async move {
+                    match TcpStream::connect(&peer_addr).await {
+                        Ok(stream) => {
+                            let sa = stream.peer_addr()
+                                .unwrap_or_else(|_| peer_addr.parse().unwrap());
+                            handle_connection(stream, sa, cfg2, Some(peers2)).await;
+                        }
+                        Err(e) => {
+                            eprintln!("[12070] outbound connect to {} failed: {}", peer_addr, e);
+                            peers2.lock().await.remove(&peer_ip);
+                        }
+                    }
+                });
             }
             Err(e) => eprintln!("[12070] UDP recv error: {}", e),
         }
@@ -575,9 +623,11 @@ async fn main() {
     println!("  Local IP: {}", cfg.local_ip);
     println!("  DB      : {}", cfg.db_path);
 
+    let outbound_peers: ConnectedPeers = Arc::new(TokioMutex::new(HashSet::new()));
+
     let t1 = tokio::spawn(run_tcp_listener(cfg.clone()));
     let t2 = tokio::spawn(run_udp_broadcaster(cfg.clone()));
-    let t3 = tokio::spawn(run_udp_listener(cfg.clone()));
+    let t3 = tokio::spawn(run_udp_listener(cfg.clone(), outbound_peers.clone()));
     let t4 = tokio::spawn(run_xml_listener(cfg.clone()));
 
     tokio::select! {
